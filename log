@@ -9,3 +9,4 @@
 2026-11-12 | Prompt 14 (Security and testing pass): Hardened string type checks, trust proxy, and image magic-byte validation; added server/tests/api.security.test.js using supertest + mongodb-memory-server. Verified all 7 security/integration tests pass.
 2026-11-12 | Prompt 15 (Deployment readiness): Installed cloudinary, updated utils/storage.js with Cloudinary upload/delete + local fallback when env vars are unset, updated .env.example, and re-ran npm test (7/7 passing).
 2026-11-12 | Prompt 16 (Seed script and documentation): Added src/utils/seed.js ("seed" script creating 3 demo users, 1 project, 15 tickets, and comments/replies) and server/README.md. Verified seed script execution.
+2026-11-12 | Git Repository & Push: Initialized git repository in server/, created https://github.com/neranjan-r/bug-tracker-backend, and pushed main branch to origin.
