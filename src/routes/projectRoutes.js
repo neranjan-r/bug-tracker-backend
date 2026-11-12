@@ -23,6 +23,14 @@ router.use(auth);
 router.post(
   "/",
   [
+    body("key")
+      .optional()
+      .isString()
+      .withMessage("Project key must be text")
+      .trim()
+      .toUpperCase()
+      .matches(/^[A-Z]{2,5}$/)
+      .withMessage("Project key must be 2 to 5 capital letters"),
     body("title")
       .isString()
       .withMessage("Project title must be text")

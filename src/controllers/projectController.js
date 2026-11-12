@@ -2,14 +2,40 @@ const mongoose = require("mongoose");
 const Project = require("../models/Project");
 const User = require("../models/User");
 const { getProjectWithRole } = require("../utils/projectAccess");
+const { deleteFile } = require("../utils/storage");
+const {
+  PROJECT_KEY_REGEX,
+  generateUniqueProjectKey,
+} = require("../utils/projectKeys");
 
 /**
  * POST /api/projects
  */
 async function createProject(req, res) {
-  const { title, description = "" } = req.body;
+  const { title, description = "", key } = req.body;
+
+  let finalKey;
+  if (key !== undefined && key !== "") {
+    finalKey = String(key).trim().toUpperCase();
+    if (!PROJECT_KEY_REGEX.test(finalKey)) {
+      return res.status(400).json({
+        success: false,
+        message: "Project key must be 2 to 5 capital letters",
+      });
+    }
+    const existing = await Project.exists({ key: finalKey });
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        message: `Project key "${finalKey}" is already in use`,
+      });
+    }
+  } else {
+    finalKey = await generateUniqueProjectKey(title);
+  }
 
   const project = await Project.create({
+    key: finalKey,
     title: title.trim(),
     description: description.trim(),
     owner: req.user._id,
@@ -25,6 +51,7 @@ async function createProject(req, res) {
         ...project.toObject(),
         role: "owner",
         ticketCount: 0,
+        openTicketCount: 0,
       },
     },
   });
@@ -40,34 +67,52 @@ async function listProjects(req, res) {
   })
     .populate("owner", "name email")
     .populate("members.user", "name email")
-    .sort({ createdAt: -1 })
+    .sort({ updatedAt: -1, createdAt: -1 })
     .lean();
 
-  // Compute ticket counts if the Ticket model is registered
-  const countMap = new Map();
+  const statsMap = new Map();
   if (mongoose.models.Ticket && projects.length > 0) {
     const projectIds = projects.map((p) => p._id);
     const counts = await mongoose.models.Ticket.aggregate([
       { $match: { project: { $in: projectIds } } },
-      { $group: { _id: "$project", count: { $sum: 1 } } },
+      {
+        $group: {
+          _id: "$project",
+          total: { $sum: 1 },
+          open: {
+            $sum: { $cond: [{ $ne: ["$status", "done"] }, 1, 0] },
+          },
+          lastTicketAt: { $max: "$updatedAt" },
+        },
+      },
     ]);
     counts.forEach((item) => {
-      countMap.set(item._id.toString(), item.count);
+      statsMap.set(item._id.toString(), item);
     });
   }
 
-  const result = projects.map((project) => {
-    const isOwner = project.owner?._id?.toString() === userId.toString();
-    const memberEntry = (project.members || []).find(
-      (m) => m.user?._id?.toString() === userId.toString()
-    );
+  const result = projects
+    .map((project) => {
+      const isOwner = project.owner?._id?.toString() === userId.toString();
+      const memberEntry = (project.members || []).find(
+        (m) => m.user?._id?.toString() === userId.toString()
+      );
+      const stats = statsMap.get(project._id.toString());
+      const projectTs = new Date(project.updatedAt || project.createdAt).getTime();
+      const ticketTs = stats?.lastTicketAt
+        ? new Date(stats.lastTicketAt).getTime()
+        : 0;
+      const latestActivity = new Date(Math.max(projectTs, ticketTs));
 
-    return {
-      ...project,
-      role: isOwner ? "owner" : memberEntry?.role || "viewer",
-      ticketCount: countMap.get(project._id.toString()) || 0,
-    };
-  });
+      return {
+        ...project,
+        role: isOwner ? "owner" : memberEntry?.role || "viewer",
+        ticketCount: stats?.total || 0,
+        openTicketCount: stats?.open || 0,
+        updatedAt: latestActivity,
+      };
+    })
+    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
 
   return res.json({
     success: true,
@@ -89,12 +134,17 @@ async function getProject(req, res) {
     return res.status(status).json({ success: false, message });
   }
 
+  const ticketCount = mongoose.models.Ticket
+    ? await mongoose.models.Ticket.countDocuments({ project: project._id })
+    : 0;
+
   return res.json({
     success: true,
     data: {
       project: {
         ...project.toObject(),
         role,
+        ticketCount,
       },
     },
   });
@@ -147,16 +197,10 @@ async function deleteProject(req, res) {
       await mongoose.models.Comment.deleteMany({ ticket: { $in: ticketIds } });
     }
 
-    // Delete stored attachment files if storage helper exists
-    try {
-      const storage = require("../utils/storage");
-      for (const ticket of tickets) {
-        for (const attachment of ticket.attachments || []) {
-          await storage.deleteFile(attachment);
-        }
+    for (const ticket of tickets) {
+      for (const attachment of ticket.attachments || []) {
+        await deleteFile(attachment).catch(() => {});
       }
-    } catch {
-      // Storage module is added in Prompt 7
     }
 
     await mongoose.models.Ticket.deleteMany({ project: projectId });

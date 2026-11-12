@@ -1,8 +1,10 @@
 const mongoose = require("mongoose");
+const Project = require("../models/Project");
 const Ticket = require("../models/Ticket");
 const storage = require("../utils/storage");
 const { emitProjectEvent } = require("../utils/socket");
 const { getProjectWithRole, resolveUserRole } = require("../utils/projectAccess");
+const { TICKET_KEY_REGEX } = require("../utils/projectKeys");
 
 const ALLOWED_TYPES = ["bug", "feature", "task"];
 const ALLOWED_PRIORITIES = ["low", "medium", "high", "critical"];
@@ -73,6 +75,18 @@ function validateAssigneeInProject(project, assignee) {
   return { valid: true, value: assignee };
 }
 
+async function enrichTicket(ticketDoc) {
+  await ticketDoc.populate([
+    { path: "reporter", select: "name email" },
+    { path: "assignee", select: "name email" },
+  ]);
+  const commentCounts = await getCommentCounts([ticketDoc._id]);
+  return {
+    ...ticketDoc.toObject(),
+    commentCount: commentCounts.get(ticketDoc._id.toString()) || 0,
+  };
+}
+
 /**
  * POST /api/projects/:projectId/tickets
  */
@@ -85,17 +99,26 @@ async function createTicket(req, res) {
     return res.status(400).json({ success: false, message: assigneeCheck.message });
   }
 
-  const lastTicket = await Ticket.findOne({
-    project: req.project._id,
-    status: "todo",
-  })
-    .sort({ order: -1 })
-    .select("order")
-    .lean();
+  // Atomic counter ensures concurrent ticket creation inside one project never collides
+  const [updatedProject, lastTicket] = await Promise.all([
+    Project.findByIdAndUpdate(
+      req.project._id,
+      { $inc: { ticketCounter: 1 } },
+      { returnDocument: "after" }
+    ),
+    Ticket.findOne({ project: req.project._id, status: "todo" })
+      .sort({ order: -1 })
+      .select("order")
+      .lean(),
+  ]);
 
+  const ticketNumber = updatedProject.ticketCounter;
+  const ticketKey = `${updatedProject.key}-${ticketNumber}`;
   const nextOrder = lastTicket ? lastTicket.order + 1 : 0;
 
   const ticket = await Ticket.create({
+    key: ticketKey,
+    number: ticketNumber,
     title: title.trim(),
     description: description.trim(),
     type,
@@ -107,12 +130,7 @@ async function createTicket(req, res) {
     order: nextOrder,
   });
 
-  await ticket.populate([
-    { path: "reporter", select: "name email" },
-    { path: "assignee", select: "name email" },
-  ]);
-
-  const result = { ...ticket.toObject(), commentCount: 0 };
+  const result = await enrichTicket(ticket);
 
   emitProjectEvent(req.project._id, "ticket:created", {
     actorId: req.user._id.toString(),
@@ -177,7 +195,7 @@ async function listTickets(req, res) {
 
   if (typeof search === "string" && search.trim()) {
     const pattern = new RegExp(escapeRegex(search.trim()), "i");
-    filter.$or = [{ title: pattern }, { description: pattern }];
+    filter.$or = [{ key: pattern }, { title: pattern }, { description: pattern }];
   }
 
   const pageNum = Math.max(1, parseInt(page, 10) || 1);
@@ -185,30 +203,35 @@ async function listTickets(req, res) {
   const skip = (pageNum - 1) * limitNum;
 
   const total = await Ticket.countDocuments(filter);
+  const projectTotal =
+    Object.keys(filter).length === 1
+      ? total
+      : await Ticket.countDocuments({ project: req.project._id });
 
   let tickets;
-  if (sort === "priority") {
+  if (sort === "priority" || sort === "priority_asc" || sort === "status" || sort === "status_desc") {
+    const isPrioritySort = sort.startsWith("priority");
+    const isAsc = sort.endsWith("_asc") || sort === "status";
+    const branches = isPrioritySort
+      ? [
+          { case: { $eq: ["$priority", "critical"] }, then: 4 },
+          { case: { $eq: ["$priority", "high"] }, then: 3 },
+          { case: { $eq: ["$priority", "medium"] }, then: 2 },
+          { case: { $eq: ["$priority", "low"] }, then: 1 },
+        ]
+      : [
+          { case: { $eq: ["$status", "todo"] }, then: 1 },
+          { case: { $eq: ["$status", "in-progress"] }, then: 2 },
+          { case: { $eq: ["$status", "done"] }, then: 3 },
+        ];
+
     const rawDocs = await Ticket.aggregate([
       { $match: filter },
-      {
-        $addFields: {
-          priorityRank: {
-            $switch: {
-              branches: [
-                { case: { $eq: ["$priority", "critical"] }, then: 4 },
-                { case: { $eq: ["$priority", "high"] }, then: 3 },
-                { case: { $eq: ["$priority", "medium"] }, then: 2 },
-                { case: { $eq: ["$priority", "low"] }, then: 1 },
-              ],
-              default: 0,
-            },
-          },
-        },
-      },
-      { $sort: { priorityRank: -1, createdAt: -1 } },
+      { $addFields: { sortRank: { $switch: { branches, default: 0 } } } },
+      { $sort: { sortRank: isAsc ? 1 : -1, createdAt: -1 } },
       { $skip: skip },
       { $limit: limitNum },
-      { $project: { priorityRank: 0 } },
+      { $project: { sortRank: 0 } },
     ]);
 
     tickets = await Ticket.populate(rawDocs, [
@@ -216,12 +239,16 @@ async function listTickets(req, res) {
       { path: "assignee", select: "name email" },
     ]);
   } else {
-    let sortSpec = { createdAt: -1 };
-    if (sort === "oldest") {
-      sortSpec = { createdAt: 1 };
-    } else if (sort === "order") {
-      sortSpec = { order: 1, createdAt: 1 };
-    }
+    const SORT_MAP = {
+      newest: { createdAt: -1 },
+      oldest: { createdAt: 1 },
+      order: { order: 1, createdAt: 1 },
+      key: { number: 1 },
+      key_desc: { number: -1 },
+      title: { title: 1, number: 1 },
+      title_desc: { title: -1, number: -1 },
+    };
+    const sortSpec = SORT_MAP[sort] || { createdAt: -1 };
 
     tickets = await Ticket.find(filter)
       .sort(sortSpec)
@@ -246,6 +273,7 @@ async function listTickets(req, res) {
         page: pageNum,
         limit: limitNum,
         total,
+        projectTotal,
         totalPages: Math.max(1, Math.ceil(total / limitNum)),
       },
     },
@@ -253,14 +281,20 @@ async function listTickets(req, res) {
 }
 
 /**
- * Helper to load a ticket and verify user's role in its project.
+ * Helper to load a ticket by ObjectId or key (e.g. BT-12) and verify user's role in its project.
  */
-async function loadAuthorizedTicket(ticketId, userId, allowedRoles = ["owner", "developer", "viewer"]) {
-  if (!mongoose.Types.ObjectId.isValid(ticketId)) {
+async function loadAuthorizedTicket(ticketIdOrKey, userId, allowedRoles = ["owner", "developer", "viewer"]) {
+  const isObjectId = mongoose.Types.ObjectId.isValid(ticketIdOrKey);
+  const upperKey = typeof ticketIdOrKey === "string" ? ticketIdOrKey.trim().toUpperCase() : "";
+  const isKey = TICKET_KEY_REGEX.test(upperKey);
+
+  if (!isObjectId && !isKey) {
     return { status: 400, message: "Invalid ticket ID", ticket: null, project: null, role: null };
   }
 
-  const ticket = await Ticket.findById(ticketId);
+  const ticket = isObjectId
+    ? await Ticket.findById(ticketIdOrKey)
+    : await Ticket.findOne({ key: upperKey });
   if (!ticket) {
     return { status: 404, message: "Ticket not found", ticket: null, project: null, role: null };
   }
@@ -296,20 +330,12 @@ async function getTicket(req, res) {
     return res.status(status).json({ success: false, message });
   }
 
-  await ticket.populate([
-    { path: "reporter", select: "name email" },
-    { path: "assignee", select: "name email" },
-  ]);
-
-  const commentCounts = await getCommentCounts([ticket._id]);
+  const enriched = await enrichTicket(ticket);
 
   return res.json({
     success: true,
     data: {
-      ticket: {
-        ...ticket.toObject(),
-        commentCount: commentCounts.get(ticket._id.toString()) || 0,
-      },
+      ticket: enriched,
       role,
     },
   });
@@ -360,16 +386,7 @@ async function updateTicket(req, res) {
     await renumberColumn(project._id, previousStatus);
   }
 
-  await ticket.populate([
-    { path: "reporter", select: "name email" },
-    { path: "assignee", select: "name email" },
-  ]);
-
-  const commentCounts = await getCommentCounts([ticket._id]);
-  const updatedTicket = {
-    ...ticket.toObject(),
-    commentCount: commentCounts.get(ticket._id.toString()) || 0,
-  };
+  const updatedTicket = await enrichTicket(ticket);
 
   emitProjectEvent(ticket.project, "ticket:updated", {
     actorId: req.user._id.toString(),
@@ -562,16 +579,7 @@ async function uploadAttachments(req, res) {
 
   req.authorizedTicket.attachments.push(...savedAttachments);
   await req.authorizedTicket.save();
-  await req.authorizedTicket.populate([
-    { path: "reporter", select: "name email" },
-    { path: "assignee", select: "name email" },
-  ]);
-
-  const commentCounts = await getCommentCounts([req.authorizedTicket._id]);
-  const updatedTicket = {
-    ...req.authorizedTicket.toObject(),
-    commentCount: commentCounts.get(req.authorizedTicket._id.toString()) || 0,
-  };
+  const updatedTicket = await enrichTicket(req.authorizedTicket);
 
   emitProjectEvent(req.authorizedProject._id, "ticket:updated", {
     actorId: req.user._id.toString(),
@@ -615,16 +623,7 @@ async function deleteAttachment(req, res) {
   await storage.deleteFile(removed);
   await ticket.save();
 
-  await ticket.populate([
-    { path: "reporter", select: "name email" },
-    { path: "assignee", select: "name email" },
-  ]);
-
-  const commentCounts = await getCommentCounts([ticket._id]);
-  const updatedTicket = {
-    ...ticket.toObject(),
-    commentCount: commentCounts.get(ticket._id.toString()) || 0,
-  };
+  const updatedTicket = await enrichTicket(ticket);
 
   emitProjectEvent(ticket.project, "ticket:updated", {
     actorId: req.user._id.toString(),

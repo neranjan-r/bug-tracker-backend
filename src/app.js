@@ -42,7 +42,6 @@ if (process.env.NODE_ENV !== "test") {
 app.use(express.json({ limit: "1mb" }));
 app.use("/uploads", express.static(UPLOADS_DIR));
 
-// Health check endpoint
 app.get("/api/health", (req, res) => {
   res.json({
     success: true,

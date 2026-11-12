@@ -361,5 +361,72 @@ describe("Bug Tracker API & Security Suite", () => {
     assert.equal(joinDenied.ok, false);
     strangerSocket.close();
   });
+
+  it("8. Project keys, sequential ticket numbers, concurrency safety, and key search", async () => {
+    // Reject invalid key format
+    const badKeyRes = await request(app)
+      .post("/api/projects")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ title: "Web Client", key: "W3B" });
+    assert.equal(badKeyRes.status, 400);
+
+    // Create project with explicit key
+    const webRes = await request(app)
+      .post("/api/projects")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ title: "Web Client", key: "web" });
+    assert.equal(webRes.status, 201);
+    assert.equal(webRes.body.data.project.key, "WEB");
+
+    // Duplicate key returns 409
+    const dupRes = await request(app)
+      .post("/api/projects")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ title: "Another Web", key: "WEB" });
+    assert.equal(dupRes.status, 409);
+
+    // Concurrent ticket creation receives distinct sequential numbers
+    const [r1, r2, r3] = await Promise.all([
+      request(app)
+        .post("/api/projects/WEB/tickets")
+        .set("Authorization", `Bearer ${ownerToken}`)
+        .send({ title: "First concurrent bug" }),
+      request(app)
+        .post("/api/projects/WEB/tickets")
+        .set("Authorization", `Bearer ${ownerToken}`)
+        .send({ title: "Second concurrent bug" }),
+      request(app)
+        .post("/api/projects/WEB/tickets")
+        .set("Authorization", `Bearer ${ownerToken}`)
+        .send({ title: "Third concurrent bug" }),
+    ]);
+
+    assert.equal(r1.status, 201);
+    assert.equal(r2.status, 201);
+    assert.equal(r3.status, 201);
+    const numbers = [r1, r2, r3].map((r) => r.body.data.ticket.number).sort();
+    assert.deepEqual(numbers, [1, 2, 3]);
+
+    // Fetch project and ticket directly by key
+    const byProjectKey = await request(app)
+      .get("/api/projects/WEB")
+      .set("Authorization", `Bearer ${ownerToken}`);
+    assert.equal(byProjectKey.status, 200);
+    assert.equal(byProjectKey.body.data.project.key, "WEB");
+
+    const byTicketKey = await request(app)
+      .get("/api/tickets/WEB-2")
+      .set("Authorization", `Bearer ${ownerToken}`);
+    assert.equal(byTicketKey.status, 200);
+    assert.equal(byTicketKey.body.data.ticket.key, "WEB-2");
+
+    // Search by key
+    const keySearch = await request(app)
+      .get("/api/projects/WEB/tickets?search=WEB-2")
+      .set("Authorization", `Bearer ${ownerToken}`);
+    assert.equal(keySearch.status, 200);
+    assert.equal(keySearch.body.data.tickets.length, 1);
+    assert.equal(keySearch.body.data.tickets[0].key, "WEB-2");
+  });
 });
 

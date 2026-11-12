@@ -16,6 +16,17 @@ const attachmentSchema = new mongoose.Schema(
 
 const ticketSchema = new mongoose.Schema(
   {
+    key: {
+      type: String,
+      required: true,
+      uppercase: true,
+      trim: true,
+    },
+    number: {
+      type: Number,
+      required: true,
+      min: 1,
+    },
     title: {
       type: String,
       required: [true, "Ticket title is required"],
@@ -70,6 +81,7 @@ const ticketSchema = new mongoose.Schema(
 );
 
 ticketSchema.index({ project: 1, status: 1, order: 1 });
+ticketSchema.index({ project: 1, number: 1 }, { unique: true });
+ticketSchema.index({ key: 1 }, { unique: true });
 
 module.exports = mongoose.model("Ticket", ticketSchema);
-

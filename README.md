@@ -1,20 +1,21 @@
-# Bug Tracker — Backend API
+# Tracebook — Backend API
 
-Express + MongoDB + Socket.io backend for the Bug Tracker application.
+Express, MongoDB, and Socket.io backend for Tracebook.
 
 ## Setup
 ```bash
 npm install
 cp .env.example .env
-npm run seed   # optional demo data
+npm run seed   # optional: 3 demo projects, 5 users, 30 tickets, ~25 comments
 npm run dev
 ```
 
 ## Scripts
 - `npm run dev` — Start development server with nodemon
 - `npm start` — Start production server
-- `npm test` — Run API, security, upload, and Socket.io tests (`mongodb-memory-server`)
-- `npm run seed` — Populate demo users, project, 15 tickets, and comments
+- `npm test` — Run API, key-generation, permission, upload, and Socket.io tests (`mongodb-memory-server`)
+- `npm run seed` — Populate demo users, projects, tickets, comments, and sample screenshots
+- `npm run migrate:keys` — Backfill missing project keys and sequential ticket numbers on older databases
 
 ## Environment Variables
 - `PORT` (default `5000`)

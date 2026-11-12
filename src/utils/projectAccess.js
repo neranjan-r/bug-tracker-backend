@@ -1,5 +1,6 @@
 const mongoose = require("mongoose");
 const Project = require("../models/Project");
+const { PROJECT_KEY_REGEX } = require("./projectKeys");
 
 /**
  * Resolve a user's role within a project ("owner", "developer", "viewer")
@@ -25,15 +26,22 @@ function resolveUserRole(project, userId) {
 }
 
 /**
- * Load a project and verify the user belongs to it.
- * Returns 404 for both missing projects and non-members so private projects are hidden.
+ * Load a project by ObjectId or project key and verify membership.
+ * Returns 404 for missing projects and non-members so private projects stay hidden.
  */
-async function getProjectWithRole(projectId, userId, { populate = false } = {}) {
-  if (!mongoose.Types.ObjectId.isValid(projectId)) {
+async function getProjectWithRole(projectIdOrKey, userId, { populate = false } = {}) {
+  const isObjectId = mongoose.Types.ObjectId.isValid(projectIdOrKey);
+  const upperKey = typeof projectIdOrKey === "string" ? projectIdOrKey.trim().toUpperCase() : "";
+  const isKey = PROJECT_KEY_REGEX.test(upperKey);
+
+  if (!isObjectId && !isKey) {
     return { status: 400, message: "Invalid project ID", project: null, role: null };
   }
 
-  let query = Project.findById(projectId);
+  let query = isObjectId
+    ? Project.findById(projectIdOrKey)
+    : Project.findOne({ key: upperKey });
+
   if (populate) {
     query = query
       .populate("owner", "name email")
@@ -58,9 +66,9 @@ async function getProjectWithRole(projectId, userId, { populate = false } = {}) 
  */
 function requireProjectAccess(allowedRoles = ["owner", "developer", "viewer"], paramName = "id") {
   return async function projectAccessMiddleware(req, res, next) {
-    const projectId = req.params[paramName];
+    const projectIdOrKey = req.params[paramName];
     const { status, message, project, role } = await getProjectWithRole(
-      projectId,
+      projectIdOrKey,
       req.user._id
     );
 
@@ -86,4 +94,3 @@ module.exports = {
   getProjectWithRole,
   requireProjectAccess,
 };
-
